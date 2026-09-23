@@ -18,7 +18,7 @@
 3. **Generate an API key** for that gateway (merchants can manage **multiple gateways**).  
 4. **Validate your site/domain** — once validated, the API key activates.  
 5. **Create invoices** from the panel _or_ via API (this document).  
-6. **Redirect customers** to the hosted checkout `payment_url`.  
+6. **Choose your checkout:** redirect customers to `payment_url` or build your own payment page using the API (section 5.4).
 7. **Receive callbacks** on your **callback URL** with payment events (e.g., `PAYMENT_SUCCESS`).  
 8. **Verify** callback authenticity using `EVENT_HASH`, then update your order state.
 
@@ -30,7 +30,7 @@
 
 ## 2) Authentication
 
-Every request must include your gateway key:
+Invoice creation (`POST /invoices` and `POST /invoices/instant`) requires your gateway key on backend requests:
 ```
 X-API-Key: <YOUR_API_KEY>
 ```
@@ -110,27 +110,56 @@ Content-Type: application/json | application/x-www-form-urlencoded
   "payment_url": "https://pay.easybitpay.com/#/pay/invoice/mVmMjM3ZWQwMzVlM"
 }
 ```
-**Next step:** Redirect your customer to `payment_url`.
-
-> Some setups also support **`POST /invoices/instant`** for immediate wallet details. Confirm availability in your panel / Postman.
+**Next step:** Redirect your customer to `payment_url`, or use the custom payment page flow in section 5.4.
 
 ### 5.2 Get Invoice (Details)
 **GET** `/invoices/{code}`
 
-Retrieve invoice by its short unique `code`.
+Retrieve a pending invoice by its short unique `code`. Returns `invoice`, `tokens_prices`, `invoice_status`, and `transactions`. For final states, use the status endpoint below; this details endpoint returns 404 when the invoice is no longer pending.
 
 ### 5.3 Get Payment Status
 **GET** `/invoices/status/{code}`
 
 Fetch the latest payment status for the invoice `code`.
 
-**Typical statuses (examples):**
-- `pending` — created, awaiting payment
-- `paid` — payment detected, awaiting confirmations
-- `confirmed` — confirmed on-chain
-- `failed` / `expired` — not payable anymore
+**Invoice status values** (`invoice_status` in this response):
+- `0` — pending
+- `1` — expired
+- `2` — canceled
+- `10` — paid/completed
 
-> **Note:** In some responses you may see numeric status codes. For example, `status: 10` means **paid**.
+There is no separate `confirmed` status in the current implementation. The response's top-level `status: "ok"` describes request success, not payment completion.
+
+### 5.4 Build Your Own Payment Page
+
+You can use the API to build a custom checkout on your own website. Redirecting to the returned `payment_url` is optional; the existing hosted checkout uses the same invoice, wallet, and status endpoints.
+
+| Step | Request / behavior |
+|---|---|
+| Create the invoice | Your backend calls `POST /invoices` with `X-API-Key`, the order amount, and `client_order_identifier`. Save the returned `invoice.code` against your order. |
+| Load payment options | `GET /invoices/{code}` returns `invoice`, `tokens_prices`, `invoice_status`, and `transactions` for a pending invoice. |
+| Select a token/network | Choose a row from `tokens_prices`, using its `token_id` and `token.network`. |
+| Allocate the payment address | `GET /wallet/{code}?token_id={token_id}` returns `walletAddress`, `expired_at` (Unix seconds), and `remain_time` (seconds). |
+| Render your checkout | Show the selected token/network, address, QR code, remaining amount, and expiry countdown. Generate the QR code in your own UI. |
+| Refresh payment progress | Poll `GET /invoices/status/{code}` and refresh `invoice_status`, `tokens_prices`, and `transactions`. |
+| Fulfill the order | Your backend verifies the merchant callback and fetches current invoice status, matching the invoice to the saved order and expected amount before fulfilling once. |
+
+Implementation details:
+
+- Keep the API key and webhook private key on your backend. Invoice creation requires `X-API-Key`; the invoice details, wallet, and status actions do not require it in this implementation. Treat invoice codes as sensitive payment links.
+- Use the selected `tokens_prices` row's `payable` for the initial total and refreshed `amount_remain` for the outstanding payment. Do not calculate the crypto amount from the order's base amount yourself; conversion, fees, and partial payments are already reflected in these fields.
+- The top-level response `status: "ok"` means the request succeeded. Payment completion is `invoice_status: 10`; the other invoice statuses are `0` pending, `1` expired, and `2` canceled. A transaction may represent only a partial payment.
+- Stop requesting payment when the invoice is paid, expired, or canceled. When the countdown reaches zero, refresh server status. Do not use a browser success screen as proof of payment.
+- `GET /invoices/{code}` returns 404 once the invoice is no longer pending. Continue using `/invoices/status/{code}` to read its final state.
+- The merchant webhook is sent to your configured callback URL. `/invoices/callback` is the internal oracle endpoint, not an endpoint your checkout should call to report a payment.
+
+### 5.5 Instant Invoice (Preselected Token)
+
+Your backend can call `POST /invoices/instant` with `X-API-Key`, `token_id`, `amount`, and optional description/order identifier. It returns `invoice`, `wallet_address`, and `expired_at` in one request. Note the field name `wallet_address`, compared with `walletAddress` from `/wallet/{code}`.
+
+The instant action uses the gateway's base token unless `base_token_id` is supplied; it does not resolve the `base_token` name used by ordinary invoice creation. The `amount` is in that base token, which may differ from the selected payment token. Fetch `/invoices/{code}` or `/invoices/status/{code}` afterward for the calculated `tokens_prices` and continue the same display/status flow.
+
+These capabilities are confirmed in the checked-in Yii API and checkout source. Verify that the target deployment exposes the same routes before integrating.
 
 ---
 
@@ -302,7 +331,7 @@ $payment->description = $invoice['description'];
 $payment->client_order_identifier = $invoice['client_order_identifier'];
 $payment->save();
 
-// Redirect end-user to hosted checkout:
+// Hosted checkout option (for your own payment page, follow section 5.4):
 return redirect($data['payment_url']);
 ```
 
